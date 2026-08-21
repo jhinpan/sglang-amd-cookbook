@@ -192,31 +192,34 @@ window.MODELS = [
             "isl": 8192,
             "osl": 1024,
             "concurrency": 1,
-            "total_tok_s": 47.8,
-            "tok_s_per_gpu": 6,
+            "total_tok_s": 430.2,
+            "tok_s_per_gpu": 53.8,
             "tpot_ms": 18.9,
             "ttft_ms": 1458,
-            "source": "glm52_fp8_playbook.md (bench_serving)"
+            "source": "glm52_fp8_playbook.md (bench_serving)",
+            "output_tok_s": 47.8
           },
           {
             "isl": 8192,
             "osl": 1024,
             "concurrency": 16,
-            "total_tok_s": 311.5,
-            "tok_s_per_gpu": 38.9,
+            "total_tok_s": 2803.5,
+            "tok_s_per_gpu": 350.4,
             "tpot_ms": 41.4,
             "ttft_ms": 10226,
-            "source": "glm52_fp8_playbook.md (bench_serving)"
+            "source": "glm52_fp8_playbook.md (bench_serving)",
+            "output_tok_s": 311.5
           },
           {
             "isl": 8192,
             "osl": 1024,
             "concurrency": 64,
-            "total_tok_s": 528.1,
-            "tok_s_per_gpu": 66,
+            "total_tok_s": 4752.9,
+            "tok_s_per_gpu": 594.1,
             "tpot_ms": 72.7,
             "ttft_ms": 15849,
-            "source": "glm52_fp8_playbook.md (bench_serving)"
+            "source": "glm52_fp8_playbook.md (bench_serving)",
+            "output_tok_s": 528.1
           },
           {
             "isl": 32768,
@@ -224,8 +227,10 @@ window.MODELS = [
             "concurrency": 1,
             "tpot_ms": 19.5,
             "ttft_ms": 4600,
-            "total_tok_s": 38.7,
-            "source": "glm52_fp8_playbook.md (long-context)"
+            "total_tok_s": 2515.5,
+            "source": "glm52_fp8_playbook.md (long-context)",
+            "output_tok_s": 38.7,
+            "tok_s_per_gpu": 314.4
           },
           {
             "isl": 131072,
@@ -233,8 +238,10 @@ window.MODELS = [
             "concurrency": 1,
             "tpot_ms": 21.5,
             "ttft_ms": 23600,
-            "total_tok_s": 19,
-            "source": "glm52_fp8_playbook.md (long-context)"
+            "total_tok_s": 4883.0,
+            "source": "glm52_fp8_playbook.md (long-context)",
+            "output_tok_s": 19,
+            "tok_s_per_gpu": 610.4
           },
           {
             "isl": 262144,
@@ -242,8 +249,10 @@ window.MODELS = [
             "concurrency": 1,
             "tpot_ms": 24.2,
             "ttft_ms": 43800,
-            "total_tok_s": 11.5,
-            "source": "glm52_fp8_playbook.md (long-context)"
+            "total_tok_s": 5899.5,
+            "source": "glm52_fp8_playbook.md (long-context)",
+            "output_tok_s": 11.5,
+            "tok_s_per_gpu": 737.4
           }
         ],
         "vs_nvidia": [
