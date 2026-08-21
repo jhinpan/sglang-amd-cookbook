@@ -2,19 +2,21 @@
 
 Single-node **TP=8** deployment of `zai-org/GLM-5.2-FP8` on **8× AMD Instinct** GPUs with SGLang, using the **DSA tilelang** attention backend. Verified end-to-end on **both** MI300X (gfx942) and MI355X (gfx950): server, latency, throughput, and accuracy (GSM8K, AIME25).
 
+> **gfx950 readers, start here instead: [`glm52_fp8_mi355x_playbook.md`](glm52_fp8_mi355x_playbook.md).** That page re-measures MI355X on SGLang 0.5.17 / ROCm 7.2.4, where the two mandatory patches of §1b are **retired** (the CK fix they were working around has landed) and MTP + fp8 KV are both available. Everything below is verified on SGLang 0.5.13.post1 / ROCm 7.2.0; the gfx942 half is unaffected and still current.
+
 > **Which GPU am I on?** `rocminfo | grep -m1 gfx` (or `rocm-smi --showproductname` for the marketing name) → `gfx942` = MI300X, `gfx950` = MI355X.
 >
 > | | MI300X (gfx942) | MI355X (gfx950) |
 > |---|---|---|
 > | VRAM/GPU | 192 GiB | 288 GiB |
 > | Launch flags | identical (§1) | **identical (§1)** |
-> | Source patches needed | **none** | **2 patches first** (§1b) — else GSM8K ≈ 0.0 |
+> | Source patches needed | **none** | **2 patches first** (§1b) — else GSM8K ≈ 0.0 — *on 0.5.13/ROCm 7.2.0; retired on 0.5.17/ROCm 7.2.4* |
 > | GSM8K (n=1319) | 97.2% | 97.7% |
 > | AIME25 (sgl-eval, avg@16) | 90.6% | **91.5%** |
 > | Single-stream decode | 48 tok/s | **67 tok/s** |
 > | c64 throughput | 528 tok/s | **1009 tok/s** |
 >
-> **The launch command is the same on both.** The ONLY MI355X-specific step is applying the two mandatory gfx950 bpreshuffle patches in §1b before the first launch. Everything else in this playbook applies to both unless a section says otherwise.
+> **The launch command is the same on both.** The ONLY MI355X-specific step is applying the two mandatory gfx950 bpreshuffle patches in §1b before the first launch — *on this image; superseded on 0.5.17, see [`glm52_fp8_mi355x_playbook.md`](glm52_fp8_mi355x_playbook.md)*. Everything else in this playbook applies to both unless a section says otherwise.
 
 > GLM-5.2 shares the DeepSeek-V3.2 / GLM-5.1 `glm_moe_dsa` architecture (MLA + **DeepSeek Sparse Attention, "DSA"**). The model code and DSA tilelang backend are already upstream in SGLang ≥ 0.5.13.post1 — **no special branch needed**. The AMD cookbook page is tracked in SGLang PR [#28471](https://github.com/sgl-project/sglang/pull/28471).
 
@@ -36,7 +38,7 @@ Key container env (from this run): `SGLANG_USE_AITER=1`, `SGLANG_USE_ROCM700A=1`
 ### Why FP8 (both GPUs)
 GLM-5.2 **BF16** weights are ~1.4 TB → ~175 GB/GPU across 8 GPUs, leaving only ~17–31 GB/GPU on MI300X (192 GiB) for KV cache + activations + CUDA graphs. BF16 **does not fit single-node on MI300X** (only MI325X/MI355X). FP8 (704 GB → 88 GB/GPU) fits comfortably on both MI300X and MI355X. No FP4 checkpoint exists. We use FP8 on both for an apples-to-apples comparison.
 
-### gfx942 is safe; gfx950 needs two patches
+### gfx942 is safe; gfx950 needs two patches (on this image — superseded, see [`glm52_fp8_mi355x_playbook.md`](glm52_fp8_mi355x_playbook.md) §1.1)
 The block-FP8 GEMM accuracy bug from PR #28471 affects **gfx950 (MI350X/MI355X)** only — **gfx942 (MI300X) is unaffected** (GSM8K confirms healthy numerics with no patches). On **gfx950 you MUST apply the two bpreshuffle patches in §1b first**, or GSM8K collapses to ~0.0. Once patched, gfx950 reaches the same accuracy as gfx942.
 
 ## 1. Launch the server (TP=8, DSA tilelang)
@@ -72,8 +74,10 @@ python3 -m sglang.launch_server \
 
 Server comes up with `max_total_num_tokens≈691904`, `context_len=1048576` on MI300X (≈1417344 on MI355X — bigger KV pool from 288 GiB GPUs).
 
-## 1b. MI355X (gfx950) — apply TWO mandatory source patches FIRST
+## 1b. MI355X (gfx950) — apply TWO mandatory source patches FIRST (superseded, see [`glm52_fp8_mi355x_playbook.md`](glm52_fp8_mi355x_playbook.md) §1.1)
 
+> **On SGLang 0.5.17 / ROCm 7.2.4 this section no longer applies** — the ROCm/rocm-libraries#8639 CK fix has landed, and forcing the gate off there costs throughput instead of buying correctness. Keep applying it on ROCm < 7.2 or aiter `7d604afe5` and older. Verified retirement: [`glm52_fp8_mi355x_playbook.md`](glm52_fp8_mi355x_playbook.md) §1.1.
+>
 > **MI300X users: skip this section.** gfx942 never touches the broken kernel paths; the §1 command works as-is. **MI355X users: the two bpreshuffle patches below are mandatory** — without them GSM8K collapses to ~0.0 with token-garbage. The launch command itself is **identical to §1** (same flags); only these source patches differ. (`SGLANG_USE_AITER=1` is set on both — via the container env / `test_glm52_fp8.sh` on MI300X, and explicitly here.)
 
 The SGLang install is editable, so patches take effect at the **next server start — no rebuild**. Run this once:
@@ -262,7 +266,7 @@ MI300X (gfx942):
 | 131,072 | 23.6 s | 21.5 ms | 19.0 |
 | 262,144 | 43.8 s | 24.2 ms | 11.5 |
 
-MI355X (gfx950):
+MI355X (gfx950) — on 0.5.13/ROCm 7.2.0; re-measured across three recipes on 0.5.17 in [`glm52_fp8_mi355x_playbook.md`](glm52_fp8_mi355x_playbook.md) §4:
 
 | Input length | TTFT median | TPOT | Output tok/s |
 |-------------:|------------:|-----:|-------------:|
