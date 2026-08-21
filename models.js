@@ -44,7 +44,7 @@ window.MODELS = [
     "family": "GLM",
     "hf_path": "zai-org/GLM-5.2-FP8",
     "architecture": "MoE + MLA with DeepSeek Sparse Attention (DSA), model_type=glm_moe_dsa (DeepSeek-V3.2 / GLM-5.1 architecture). 1M context window.",
-    "precision": "FP8 (block-FP8 weights), bf16 KV cache",
+    "precision": "FP8 (block-FP8 weights); bf16 or fp8_e4m3 KV cache",
     "status": "verified",
     "params_active": "39B",
     "params_total": "743B",
@@ -54,27 +54,43 @@ window.MODELS = [
     "context_len": "1048576",
     "summary": [
       {
-        "text": "Single-node TP=8 deployment of zai-org/GLM-5.2-FP8 (MoE + MLA/DSA, glm_moe_dsa) with SGLang and the DSA tilelang prefill+decode backend, verified on BOTH 8x MI300X (gfx942) and 8x MI355X (gfx950)."
+        "text": "Single-node TP=8 deployment of zai-org/GLM-5.2-FP8 (MoE + MLA/DSA, glm_moe_dsa) with SGLang and the DSA tilelang prefill+decode backend, verified on BOTH 8x MI300X (gfx942) and 8x MI355X (gfx950). The gfx950 cells are re-measured on SGLang 0.5.17 / ROCm 7.2.4, where three things changed at once: the mandatory source patches are gone, MTP speculative decoding works, and the KV cache can be fp8."
       },
       {
         "topic": "memory",
-        "text": "FP8 weights (704 GB -> 88 GB/GPU) fit single-node; BF16 (~1.4 TB -> ~175 GB/GPU) does not. bf16 KV cache, chunked-prefill 8192, no MTP/speculative decoding on AMD."
+        "text": "FP8 weights (704 GB -> 88 GB/GPU) fit single-node; BF16 (~1.4 TB -> ~175 GB/GPU) does not fit on MI300X. No FP4 checkpoint exists."
       },
       {
         "topic": "gfx950 patches",
-        "text": "The launch command is IDENTICAL on both GPUs; gfx950 additionally requires TWO mandatory source patches first (the _use_aiter_bpreshuffle_gfx95=False flag in BOTH fp8_utils.py and models/deepseek_common/utils.py) or GSM8K collapses to ~0.0 (#28685, ROCm 7.2 kernel miscompile) -- gfx942 needs none of them. (A third, SGLANG_FP8_PAGED_MQA_LOGITS_TORCH, is already the correct default for GLM-5.2's GlmMoeDsaForCausalLM path and only matters if you also serve DeepSeek-V4 from the same tree.)"
+        "text": "The two mandatory bpreshuffle patches are RETIRED on ROCm 7.2.4 with aiter d9e5ef7ce. The condition the older cell itself named as ending the workaround, the CK rewrite ROCm/rocm-libraries#8639, is present in this image. Measured A/B with the patch as the only difference: GSM8K 0.980 either way, and the patched arm is 7-9% slower in wall clock depending on request shape. On an older image, or any ROCm below 7.2, keep them."
+      },
+      {
+        "topic": "speculative decode",
+        "text": "MTP/NEXTN runs on ROCm for glm_moe_dsa as of 0.5.17, which retires the earlier gap. The draft rides in the same checkpoint, accept length is 3.56 of 4 draft tokens, and single-stream decode goes from 81 tok/s without it to 200 tok/s with it at ISL 8192."
+      },
+      {
+        "topic": "kv cache",
+        "text": "fp8_e4m3 KV is legal on the tilelang DSA path on ROCm and only on ROCm. It takes the pool from 1,645,440 tokens to 3,194,368 at otherwise identical flags, at +0.0 pp on GSM8K and -0.38% on speculative accept length. Long-context accuracy under fp8 KV is NOT yet verified -- see the gaps."
       },
       {
         "topic": "accuracy",
-        "text": "Accuracy at parity on both (GSM8K 97.2% / 97.7%; AIME25 via sgl-eval pass@1 avg-of-16: MI300X 90.6%, MI355X 91.5% -- both within noise, both beat the 87.7% ref)."
+        "text": "GSM8K n=1319 on 0.5.17: 97.1% low-latency, 97.3% balanced, 97.2% high-throughput, against 97.7% for the 0.5.13 patched no-speculation recipe and 97.2% on gfx942. AIME25 91.5% via sgl-eval on gfx942/gfx950 is carried from 0.5.13 and has not been re-run."
+      },
+      {
+        "topic": "benchmarking",
+        "text": "The benchmark rows in the gfx950 cells are --dataset-name random, which overstates speculative accept length on this model as it does on Kimi-K3. Measured here: 3.994 of 4 on random, 2.969 on ShareGPT and 3.5565 on GSM8K. The rows are kept for comparability with the cell they replace; size speculation from the real-text figures."
+      },
+      {
+        "topic": "tuning · kv pool",
+        "text": "Concurrency is the wrong knob. floor(pool_tokens / peak_context_tokens) is the admission ceiling, and concurrency divided by it ordered every point measured across six configs, both KV dtypes and every pool size: 14 of 14 healthy below 1.0, 5 of 5 collapsed above it, with a 4.5x gap and nothing in between. Past the ceiling, --schedule-policy lpm costs 2.8-11x less than fcfs. Both inputs are known before the first request."
       },
       {
         "topic": "mi300x vs mi355x",
-        "text": "MI355X is ~1.4-1.9x faster than MI300X (single-stream 67 vs 48 tok/s; c64 1009 vs 528 tok/s)."
+        "text": "MI355X is ~1.4-1.9x faster than MI300X on the same recipe (single-stream 67 vs 48 tok/s, c64 throughput 1009 vs 528), before any of the 0.5.17 gains above."
       },
       {
         "topic": "long context",
-        "text": "LongBench-v2 59.5%, near-flat decode TPOT at long ctx."
+        "text": "LongBench-v2 59.5%, near-flat decode TPOT out to 256k."
       }
     ],
     "configs": [
@@ -336,15 +352,15 @@ window.MODELS = [
         }
       },
       {
-        "gfx": "gfx950",
         "hw_name": "MI355X",
+        "gfx": "gfx950",
         "gpus": 8,
         "quant": "FP8 (block-FP8 MoE weights), bf16 KV cache",
         "strategy": "low-latency",
         "nodes": "single",
         "verified": true,
-        "docker_image": null,
-        "launch_python": "# ============================================================================\n# STEP 1 (gfx950 ONLY) — apply TWO MANDATORY source patches before first launch.\n# Without them GSM8K collapses to ~0.0 with token-garbage. MI300X/gfx942 needs\n# NONE of these (see the MI300X tab: identical launch flags, no patches).\n# Editable install => patches take effect at next process start, no rebuild.\n# ============================================================================\nSRT=$(python3 -c 'import os,sglang.srt as m; print(os.path.dirname(m.__file__))')\n# Patch #1  block-FP8 bpreshuffle GEMM is miscompiled on ROCm 7.2 (sglang #28685).\nsed -i 's/^_use_aiter_bpreshuffle_gfx95 = .*/_use_aiter_bpreshuffle_gfx95 = False  # FORCED OFF (gfx950 #28685)/' \\\n  \"$SRT/layers/quantization/fp8_utils.py\"\n# Patch #1b SAME flag, SECOND definition. GLM-5.2 is GlmMoeDsaForCausalLM ->\n#          DeepseekV2ForCausalLM, and its MLA/activation-quant path reads the flag\n#          from deepseek_common/utils.py, NOT from fp8_utils.py. Patching only #1\n#          leaves GSM8K=0.0 -- THIS is the easy-to-miss one.\nsed -i 's/^_use_aiter_bpreshuffle_gfx95 = .*/_use_aiter_bpreshuffle_gfx95 = False  # FORCED OFF (gfx950 #28685)/' \\\n  \"$SRT/models/deepseek_common/utils.py\"\n# Verify BOTH say False (the fix is the value, not just the name):\ngrep -n '^_use_aiter_bpreshuffle_gfx95' \"$SRT/layers/quantization/fp8_utils.py\" \"$SRT/models/deepseek_common/utils.py\"\n\n# ----------------------------------------------------------------------------\n# OPTIONAL (only if you ALSO serve DeepSeek-V4 from this same tree):\n# SGLANG_FP8_PAGED_MQA_LOGITS_TORCH must be False for long-context correctness.\n# For GLM-5.2 this is ALREADY the default -- the .set(True) line lives in the\n# DeepseekV4ForCausalLM branch of server_args.py, and GLM-5.2's model_arch is\n# GlmMoeDsaForCausalLM, so it never runs and the global default (False) holds.\n# Long-context needle-recall verified PASS on the default, no patch. Apply the\n# env-aware patch below ONLY for DeepseekV4 (it is a no-op for GLM-5.2):\n#   python3 - \"$SRT/server_args.py\" <<'PY'\n#   import sys; p=sys.argv[1]; L=open(p).read().split(chr(10)); hip=False\n#   for i,l in enumerate(L):\n#       s=l.strip()\n#       if s=='elif is_hip():': hip=True; continue\n#       if hip and (s.startswith('elif ') or s.startswith('else:')): hip=False\n#       if hip and 'SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)' in l:\n#           ind=l[:len(l)-len(l.lstrip())]\n#           L[i]=ind+'if not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.is_set():'+chr(10)+ind+'    envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(False)'\n#           break\n#   open(p,'w').write(chr(10).join(L))\n#   PY\n\n# ============================================================================\n# STEP 2 — launch (TP=8, DSA tilelang). The launch FLAGS are IDENTICAL to the\n# MI300X tab; SGLANG_USE_AITER=1 is also set there (via the container env /\n# test_glm52_fp8.sh wrapper) -- set it explicitly here to be self-contained.\n# ============================================================================\nexport SGLANG_USE_AITER=1\nexport PYTORCH_HIP_ALLOC_CONF=expandable_segments:True\npython3 -m sglang.launch_server \\\n  --model-path zai-org/GLM-5.2-FP8 --served-model-name glm-5.2 \\\n  --trust-remote-code --tp 8 \\\n  --dsa-prefill-backend tilelang --dsa-decode-backend tilelang \\\n  --kv-cache-dtype bfloat16 --chunked-prefill-size 8192 \\\n  --mem-fraction-static 0.85 --cuda-graph-max-bs 64 --max-running-requests 64 \\\n  --watchdog-timeout 1200 --host 0.0.0.0 --port 30000",
+        "docker_image": "rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820",
+        "launch_python": "# gfx950 / MI355X, low-latency: MTP speculative decode, bf16 KV.\n# NO source patches on this image (ROCm 7.2.4 + aiter d9e5ef7ce) -- the two\n# bpreshuffle disables the 0.5.13 recipe required are now counter-productive.\n# The NextN draft rides in the same checkpoint; there is no second download.\nexport SGLANG_USE_AITER=1\nexport PYTORCH_HIP_ALLOC_CONF=expandable_segments:True\npython3 -m sglang.launch_server \\\n  --model-path zai-org/GLM-5.2-FP8 \\\n  --served-model-name glm-5.2 \\\n  --trust-remote-code \\\n  --tp 8 \\\n  --dsa-prefill-backend tilelang \\\n  --dsa-decode-backend tilelang \\\n  --kv-cache-dtype bfloat16 \\\n  --speculative-algorithm NEXTN \\\n  --chunked-prefill-size 16384 \\\n  --mem-fraction-static 0.85 \\\n  --cuda-graph-max-bs 32 \\\n  --max-running-requests 32 \\\n  --reasoning-parser glm45 \\\n  --tool-call-parser glm47 \\\n  --watchdog-timeout 1200 \\\n  --host 0.0.0.0 \\\n  --port 30000",
         "parallelism": {
           "tp": 8,
           "ep": null,
@@ -354,20 +370,20 @@ window.MODELS = [
         "moe_backend": null,
         "aiter": {
           "enabled": true,
-          "commit": "7d604afe5",
+          "commit": "d9e5ef7ce",
           "kernels": [
-            "GEMM (glm5_bf16_tuned_gemm.csv)"
+            "block-FP8 GEMM (a8w8_blockscale_bpreshuffle, gfx950 path ENABLED)"
           ],
           "tuned_artifacts": [
-            "glm5_bf16_tuned_gemm.csv"
+            "a8w8_blockscale_bpreshuffle_tuned_gemm_glm5.2.csv"
           ],
-          "summary": "AITER enabled (SGLANG_USE_AITER=1). The gfx950 bpreshuffle block-FP8 GEMM path is force-disabled in source in BOTH definition sites (miscompiled on ROCm 7.2, #28685); falls back to the correct ck_gemm_a8w8_blockscale (verified cosine 1.0 on gfx950). DSA attention runs via tilelang."
+          "summary": "AITER enabled (SGLANG_USE_AITER=1) with the gfx950 block-FP8 bpreshuffle path left ON, which is the 0.5.17 default on ROCm >= 7.2. The image ships the preshuffle_ON CK modules prebuilt and a GLM-5.2-specific tuned table for that kernel; the 0.5.13 recipe's source disable forfeits both and measured ~7% slower at identical GSM8K. DSA attention runs through tilelang, not AITER."
         },
         "env": [
           {
             "key": "SGLANG_USE_AITER",
             "value": "1",
-            "why": "AITER kernels; ships glm5_bf16_tuned_gemm.csv"
+            "why": "AITER kernels; on this image that includes the GLM-5.2-specific bpreshuffle tuned GEMM table"
           },
           {
             "key": "PYTORCH_HIP_ALLOC_CONF",
@@ -378,15 +394,15 @@ window.MODELS = [
         "accuracy": [
           {
             "name": "GSM8K",
-            "value": "97.7%",
-            "note": "n=1319, chat+thinking; run_eval --eval-name gsm8k --thinking-mode glm-45 --max-tokens 8192 --temperature 0. REQUIRES the two mandatory gfx950 bpreshuffle patches (fp8_utils.py AND models/deepseek_common/utils.py). Without the SECOND one (deepseek_common/utils.py, which GLM-5.2's GlmMoeDsaForCausalLM->DeepseekV2ForCausalLM MLA/quant path actually reads), GSM8K collapses to 0.0 with token-garbage under batching. n=100 subset scored 98.0%.",
-            "ref": "98.2% (cookbook ref); MI300X/gfx942 re-run 97.2% — gfx950 reaches parity once both bpreshuffle sites are fixed"
+            "value": "97.1%",
+            "note": "n=1319, chat+thinking; run_eval --eval-name gsm8k --thinking-mode glm-45 --max-tokens 8192 --temperature 0 --num-threads 32, driven 32-wide on purpose because the bpreshuffle failure mode was M-tile sensitive and a serial eval is the one shape that would miss it. Speculative decoding on: mean accept length 3.5565 of 4 draft tokens.",
+            "ref": "97.7% on the 0.5.13 image (patched, no speculation, bf16 KV). Difference -0.6 pp = -1.0 sigma on n=1319 vs n=1319, i.e. not resolvable at this sample size. gfx942 re-run 97.2%."
           },
           {
             "name": "AIME25",
             "value": "91.5%",
-            "note": "pass@1 avg-of-16 via sgl-eval (NV official harness), n=30x16=480 samples; 95% CI 89.1-93.8 (pass@1 91.46% +/- 1.96*SEM, SEM 1.22%, std 4.86%). pass@16 100%, majority@16 93.3%, truncated 0.21%, error 0%, 9.46M completion tokens. Requires the two mandatory gfx950 bpreshuffle patches. Run with --n-repeats 16 --max-tokens 64000 --temperature 1.0 --top-p 0.95 --thinking. CAVEAT: always use sgl-eval, NOT in-tree run_eval (its strict Answer: first-match regex badly undercounts this thinking model). gfx950 reaches parity with gfx942 (90.6%) once the bpreshuffle sites are fixed.",
-            "ref": "87.7% (cookbook ref) -- beats ref; MI300X/gfx942 re-run 90.6% -- gfx950 at parity within noise"
+            "note": "NOT re-measured on this image. Carried from the 0.5.13.post1 / aiter 7d604afe5 run of the no-speculation recipe: pass@1 avg-of-16 via sgl-eval (NV official harness), n=30x16=480, 95% CI 89.1-93.8, pass@16 100%, majority@16 93.3%. Speculative decoding verifies exactly and should not move it, but that is an argument, not a measurement. Always use sgl-eval, NOT in-tree run_eval, whose strict first-match Answer: regex badly undercounts this thinking model.",
+            "ref": "87.7% (cookbook ref); MI300X/gfx942 90.6%"
           }
         ],
         "benchmarks": [
@@ -394,103 +410,470 @@ window.MODELS = [
             "isl": 8192,
             "osl": 1024,
             "concurrency": 1,
-            "total_tok_s": 66.92,
-            "tok_s_per_gpu": 8.4,
-            "tpot_ms": 14.43,
-            "ttft_ms": 652.13,
-            "source": "MI355X re-run (bench_serving, conc=1; output verified correct, GSM8K 97.7%)"
+            "ttft_ms": 591.0,
+            "tpot_ms": 4.99,
+            "decode_tok_s": 200.4,
+            "output_tok_s": 179.74,
+            "total_tok_s": 1617.68,
+            "tok_s_per_gpu": 202.2,
+            "source": "glm52_fp8_mi355x_playbook.md section 4.1 (bench_serving, random, --random-range-ratio 1.0, --flush-cache, warmup burst discarded; rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820, sglang 0.5.17.dev20260820+g47fc97d754, aiter d9e5ef7ce)"
+          },
+          {
+            "isl": 8192,
+            "osl": 1024,
+            "concurrency": 8,
+            "ttft_ms": 1450.0,
+            "tpot_ms": 10.24,
+            "output_tok_s": 676.02,
+            "total_tok_s": 6084.21,
+            "tok_s_per_gpu": 760.5,
+            "source": "glm52_fp8_mi355x_playbook.md section 4.1 (bench_serving, random, --random-range-ratio 1.0, --flush-cache, warmup burst discarded; rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820, sglang 0.5.17.dev20260820+g47fc97d754, aiter d9e5ef7ce)"
           },
           {
             "isl": 8192,
             "osl": 1024,
             "concurrency": 16,
-            "total_tok_s": 535.66,
-            "tok_s_per_gpu": 67.0,
-            "tpot_ms": 25.22,
-            "ttft_ms": 4790.27,
-            "source": "MI355X re-run (bench_serving, conc=16; output verified correct)"
+            "ttft_ms": 2318.0,
+            "tpot_ms": 15.05,
+            "output_tok_s": 872.48,
+            "total_tok_s": 7852.31,
+            "tok_s_per_gpu": 981.5,
+            "source": "glm52_fp8_mi355x_playbook.md section 4.1 (bench_serving, random, --random-range-ratio 1.0, --flush-cache, warmup burst discarded; rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820, sglang 0.5.17.dev20260820+g47fc97d754, aiter d9e5ef7ce)"
+          },
+          {
+            "isl": 8192,
+            "osl": 1024,
+            "concurrency": 32,
+            "ttft_ms": 4321.0,
+            "tpot_ms": 24.0,
+            "output_tok_s": 1086.51,
+            "total_tok_s": 9778.56,
+            "tok_s_per_gpu": 1222.3,
+            "source": "glm52_fp8_mi355x_playbook.md section 4.1 (bench_serving, random, --random-range-ratio 1.0, --flush-cache, warmup burst discarded; rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820, sglang 0.5.17.dev20260820+g47fc97d754, aiter d9e5ef7ce)"
           },
           {
             "isl": 8192,
             "osl": 1024,
             "concurrency": 64,
-            "total_tok_s": 1008.95,
-            "tok_s_per_gpu": 126.1,
-            "tpot_ms": 41.45,
-            "ttft_ms": 13794.52,
-            "source": "MI355X re-run (bench_serving, conc=64; output verified correct)"
+            "ttft_ms": 29079.0,
+            "tpot_ms": 25.87,
+            "output_tok_s": 1098.93,
+            "total_tok_s": 9890.34,
+            "tok_s_per_gpu": 1236.3,
+            "source": "glm52_fp8_mi355x_playbook.md section 4.1 (bench_serving, random, --random-range-ratio 1.0, --flush-cache, warmup burst discarded; rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820, sglang 0.5.17.dev20260820+g47fc97d754, aiter d9e5ef7ce)"
           },
           {
             "isl": 8192,
             "osl": 512,
             "concurrency": 1,
-            "tpot_ms": 14.43,
-            "ttft_ms": 410.76,
-            "total_tok_s": 65.67,
-            "source": "MI355X re-run (long-context, conc=1)"
+            "ttft_ms": 588.0,
+            "tpot_ms": 4.96,
+            "decode_tok_s": 201.5,
+            "output_tok_s": 163.71,
+            "total_tok_s": 2782.99,
+            "tok_s_per_gpu": 347.9,
+            "source": "glm52_fp8_mi355x_playbook.md section 4.1 (bench_serving, random, --random-range-ratio 1.0, --flush-cache, warmup burst discarded; rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820, sglang 0.5.17.dev20260820+g47fc97d754, aiter d9e5ef7ce)"
           },
           {
             "isl": 32768,
             "osl": 512,
             "concurrency": 1,
-            "tpot_ms": 14.89,
-            "ttft_ms": 1180.39,
-            "total_tok_s": 58.19,
-            "source": "MI355X re-run (long-context, conc=1)"
+            "ttft_ms": 2461.0,
+            "tpot_ms": 5.09,
+            "decode_tok_s": 196.5,
+            "output_tok_s": 101.1,
+            "total_tok_s": 6571.23,
+            "tok_s_per_gpu": 821.4,
+            "source": "glm52_fp8_mi355x_playbook.md section 4.1 (bench_serving, random, --random-range-ratio 1.0, --flush-cache, warmup burst discarded; rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820, sglang 0.5.17.dev20260820+g47fc97d754, aiter d9e5ef7ce)"
           },
           {
             "isl": 131072,
             "osl": 512,
             "concurrency": 1,
-            "tpot_ms": 16.63,
-            "ttft_ms": 5457.26,
-            "total_tok_s": 36.66,
-            "source": "MI355X re-run (long-context, conc=1)"
+            "ttft_ms": 12152.0,
+            "tpot_ms": 5.59,
+            "decode_tok_s": 178.7,
+            "output_tok_s": 34.1,
+            "total_tok_s": 8764.25,
+            "tok_s_per_gpu": 1095.5,
+            "source": "glm52_fp8_mi355x_playbook.md section 4.1 (bench_serving, random, --random-range-ratio 1.0, --flush-cache, warmup burst discarded; rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820, sglang 0.5.17.dev20260820+g47fc97d754, aiter d9e5ef7ce)"
           },
           {
             "isl": 262144,
             "osl": 512,
             "concurrency": 1,
-            "tpot_ms": 18.89,
-            "ttft_ms": 9584.27,
-            "total_tok_s": 26.59,
-            "source": "MI355X re-run (long-context, conc=1)"
+            "ttft_ms": 29394.0,
+            "tpot_ms": 6.29,
+            "decode_tok_s": 159.1,
+            "output_tok_s": 15.7,
+            "total_tok_s": 8054.64,
+            "tok_s_per_gpu": 1006.8,
+            "source": "glm52_fp8_mi355x_playbook.md section 4.1 (bench_serving, random, --random-range-ratio 1.0, --flush-cache, warmup burst discarded; rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820, sglang 0.5.17.dev20260820+g47fc97d754, aiter d9e5ef7ce)"
           }
         ],
         "vs_nvidia": [],
         "gotchas": [
-          "CRITICAL gfx950 fix (TWO mandatory sites): _use_aiter_bpreshuffle_gfx95 must be forced False in BOTH (1) python/sglang/srt/layers/quantization/fp8_utils.py and (2) python/sglang/srt/models/deepseek_common/utils.py. ROCm 7.2 hipcc miscompiles aiter gemm_a8w8_blockscale_bpreshuffle (drops -mllvm -amdgpu-coerce-illegal-types), #28685. GLM-5.2 is GlmMoeDsaForCausalLM -> DeepseekV2ForCausalLM (models/glm4_moe.py), and its MLA/activation-quant path reads the flag from deepseek_common/utils.py, so patching ONLY fp8_utils.py leaves the model forward path broken -> GSM8K 0.0 and batched-decode token-garbage. With BOTH patched: GSM8K 97.7%, batched output correct. gfx942/MI300X is unaffected (never uses the bpreshuffle path).",
-          "The miscompiled bpreshuffle kernel is M-tile-sensitive (wrong rows cluster at 16-row tile boundaries, shift between runs), so single-token-answer bs=1 prompts can look correct while batched/longer prompts corrupt -- it is ONE bug, not a separate batching bug.",
-          "SGLANG_FP8_PAGED_MQA_LOGITS_TORCH must be False for long-context correctness -- but for GLM-5.2 this is ALREADY the default and needs NO patch. The .set(True) line in server_args.py is inside the `model_arch in [DeepseekV4ForCausalLM]` branch (~line 3786); GLM-5.2's model_arch is GlmMoeDsaForCausalLM, so that branch never runs and the global EnvBool default (False, environ.py) holds. Verified: long-context needle-recall PASSED on the default with no patch. The env-aware server_args.py patch only matters if you ALSO serve DeepSeek-V4 from the same tree (where .set(True) would otherwise clobber a shell export). Do NOT list it as a GLM-5.2 requirement.",
-          "KV-cache dtype must be bfloat16 with the DSA tilelang backend (FP8 KV incompatible).",
-          "Keep --chunked-prefill-size 8192 (unchunked long prefill trips the tilelang DSA tile limit).",
-          "No MTP / speculative decoding on AMD/gfx950.",
-          "Upstream permanent fix is the CK kernel rewrite ROCm/rocm-libraries#8639 (scalar-FMA/VGPR accumulator), which supersedes the disable workaround; not in aiter 7d604afe5, so the source workaround is required for now.",
-          "PERF: MI355X single-stream 67 tok/s and long-ctx TPOT near-flat 14.4->18.9ms (8k->256k) BEAT MI300X (48 tok/s, 18.9->24.2ms); c64 throughput 1009 tok/s vs MI300X 528."
+          "The two mandatory gfx950 bpreshuffle patches are NOT needed on this image, and applying them now costs throughput. This cell's own predecessor stated the exit condition: \"upstream permanent fix is the CK kernel rewrite ROCm/rocm-libraries#8639, which supersedes the disable workaround; not in aiter 7d604afe5, so the source workaround is required for now.\" This image ships aiter d9e5ef7ce, and #8639 is present in its CK submodule (the VGPR-anchor asm volatile in blockwise_gemm_pipeline_xdlops_blockscale_b_preshuffle_v1/v3.hpp). sglang 0.5.17 agrees: _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7,2,0), so the flag is True by default here. Measured A/B on this image, same argv, patch the only difference: GSM8K 0.980 both arms (n=200), and the patched arm is slower in wall clock at every concurrency measured, on both request shapes: -8.8/-8.5/-9.0% at ISL 8192 / OSL 1024 and -7.2/-7.0/-7.0% on a 76k-context multi-turn shape, with output-token counts identical to 0.00% in all six pairs. Forcing the flag False also forces an aiter JIT build of the preshuffle_off modules at every start, which the image does not ship prebuilt, and skips a8w8_blockscale_bpreshuffle_tuned_gemm_glm5.2.csv, a GLM-5.2-specific tuned table for exactly this kernel. On an older image, or any ROCm below 7.2, keep the patches.",
+          "Concurrency is the wrong knob; tokens are. The admission ceiling is floor(KV_pool_tokens / peak_context_tokens), and concurrency / that ceiling ordered every point measured across all six configs, both KV dtypes and every pool size: below 1.0 all 14 points were healthy, above it all 5 collapsed, with a 4.5x gap and nothing in it. Past 1.0, --schedule-policy decides how bad it gets -- lpm beat fcfs by 2.8-11x on otherwise comparable points. Read the pool from get_server_info at startup and the peak context off your own traffic; you can tell which side of the cliff you are on without benchmarking. --max-running-requests is an upper bound only, and on this model at real context lengths it is almost never the binding one.",
+          "Keep --chunked-prefill-size at or below 32768; an unchunked long prefill trips the tilelang DSA tile limit.",
+          "MTP/NEXTN works on ROCm for glm_moe_dsa as of 0.5.17 -- the earlier \"not enabled on AMD\" note is retired. GlmMoeDsaForCausalLMNextN is in models/glm4_moe.py, model_config.py swaps the draft architecture in, and speculative_hook.py sets --speculative-draft-model-path to the model path itself (the draft rides in the same checkpoint -- there is no second download) and auto-chooses (num_steps, eagle_topk, num_draft_tokens) = (3, 1, 4) for this architecture. Enabling speculation also silently resets --max-running-requests to 48 when it is unset. One caveat that is real but not fatal: the DSA MTP metadata precompute falls back to a non-fused path on ROCm (if _is_cuda and not _is_hip: in dsa_backend_mtp_precompute.py), so the ROCm accept path is not yet running its fastest kernel. Measured accept length 3.56 of 4 on GSM8K.",
+          "Do not read this cell's accept length off the benchmark table. The rows above are --dataset-name random, and this repo's standing finding applies here too: uniformly random token ids at temperature 0 with ignore_eos push the model into low-entropy text that a draft predicts almost perfectly. Measured on GLM-5.2 with degeneracy_probe.py at ISL 8192 -- unique token ratio 0.0176, most-repeated 8-gram 27x over 512 generated tokens. Accept length by workload on this model: 3.994 of 4 on random, 2.969 on ShareGPT, 3.5565 on GSM8K. The synthetic rows are kept because they are what makes this table comparable to the 0.5.13 cell they replace, but size speculative decoding from the ShareGPT and GSM8K figures, not from the random one.",
+          "--cuda-graph-max-bs is a hard ceiling, not a hint: every decode batch wider than it runs eager. These recipes set 32, so the concurrency-64 row is measuring that flag, not the recipe's limit. Verified from the scheduler's own decode lines -- 0 of 50 batches eager at running-req <= 32, 88 of 88 eager above it -- and aggregate throughput FALLS from concurrency 32 to 64 while the pool sits at 17% used, which contention cannot explain. It is also not scheduling: holding everything else fixed and flipping --schedule-policy fcfs -> lpm at that same point moves TTFT +0.6%, TPOT -0.7%, throughput +0.4% and accept length +0.5% -- nothing, because an almost-empty pool has no queue to reorder. If you intend to run wider than 32, raise --cuda-graph-max-bs with the width."
         ],
         "provenance": {
-          "image": null,
-          "pr": "https://github.com/sgl-project/sglang/pull/28471",
-          "sglang": "0.5.13.post1.dev20260622 (g4923bb93ae), editable + 2 mandatory gfx950 bpreshuffle disables (fp8_utils.py + deepseek_common/utils.py); MQA-logits env left at its correct GLM-5.2 default (False)",
-          "aiter": "7d604afe5; SGLANG_USE_AITER=1; bpreshuffle gfx95 path disabled in source (both sites)",
-          "rocm": "7.2.0",
-          "date": "2026-06-24",
-          "node": "mia1-p02-g45, 8x MI355X (gfx950), 288 GiB each; PyTorch 2.9.1+rocm7.2.0"
+          "image": "rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820",
+          "pr": "https://github.com/sgl-project/sglang/pull/28471 (original AMD recipe)",
+          "sglang": "0.5.17.dev20260820+g47fc97d754, stock image, NO source patches -- the two gfx950 bpreshuffle disables the 0.5.13 recipe required are counter-productive here (see gotchas)",
+          "aiter": "d9e5ef7ce; SGLANG_USE_AITER=1; gfx950 bpreshuffle path ENABLED (upstream default on ROCm >= 7.2)",
+          "rocm": "7.2.4",
+          "date": "2026-08-20",
+          "node": "8x AMD Instinct MI355X (gfx950), 288 GiB each, single node"
+        }
+      },
+      {
+        "hw_name": "MI355X",
+        "gfx": "gfx950",
+        "gpus": 8,
+        "quant": "FP8 (block-FP8 MoE weights), fp8_e4m3 KV cache",
+        "strategy": "balanced",
+        "nodes": "single",
+        "verified": true,
+        "docker_image": "rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820",
+        "launch_python": "# gfx950 / MI355X, balanced: MTP speculative decode ON TOP OF an fp8_e4m3 KV\n# cache. fp8 KV is ROCm-only on the tilelang DSA path. mem-fraction is 0.88\n# and not higher on purpose -- see the lazy-kernel gotcha.\nexport SGLANG_USE_AITER=1\nexport PYTORCH_HIP_ALLOC_CONF=expandable_segments:True\npython3 -m sglang.launch_server \\\n  --model-path zai-org/GLM-5.2-FP8 \\\n  --served-model-name glm-5.2 \\\n  --trust-remote-code \\\n  --tp 8 \\\n  --dsa-prefill-backend tilelang \\\n  --dsa-decode-backend tilelang \\\n  --kv-cache-dtype fp8_e4m3 \\\n  --speculative-algorithm NEXTN \\\n  --chunked-prefill-size 16384 \\\n  --mem-fraction-static 0.85 \\\n  --cuda-graph-max-bs 32 \\\n  --max-running-requests 48 \\\n  --schedule-policy lpm \\\n  --reasoning-parser glm45 \\\n  --tool-call-parser glm47 \\\n  --watchdog-timeout 1200 \\\n  --host 0.0.0.0 \\\n  --port 30000",
+        "parallelism": {
+          "tp": 8,
+          "ep": null,
+          "dp": null
+        },
+        "attention_backend": "DSA tilelang (prefill+decode)",
+        "moe_backend": null,
+        "aiter": {
+          "enabled": true,
+          "commit": "d9e5ef7ce",
+          "kernels": [
+            "block-FP8 GEMM (a8w8_blockscale_bpreshuffle, gfx950 path ENABLED)"
+          ],
+          "tuned_artifacts": [
+            "a8w8_blockscale_bpreshuffle_tuned_gemm_glm5.2.csv"
+          ],
+          "summary": "AITER enabled (SGLANG_USE_AITER=1) with the gfx950 block-FP8 bpreshuffle path left ON, which is the 0.5.17 default on ROCm >= 7.2. The image ships the preshuffle_ON CK modules prebuilt and a GLM-5.2-specific tuned table for that kernel; the 0.5.13 recipe's source disable forfeits both and measured ~7% slower at identical GSM8K. DSA attention runs through tilelang, not AITER."
+        },
+        "env": [
+          {
+            "key": "SGLANG_USE_AITER",
+            "value": "1",
+            "why": "AITER kernels; on this image that includes the GLM-5.2-specific bpreshuffle tuned GEMM table"
+          },
+          {
+            "key": "PYTORCH_HIP_ALLOC_CONF",
+            "value": "expandable_segments:True",
+            "why": "reduce HIP allocator fragmentation for large MoE weights"
+          }
+        ],
+        "accuracy": [
+          {
+            "name": "GSM8K",
+            "value": "97.3%",
+            "note": "n=1319, same harness and flags as the low-latency cell. This is the only cell stacking speculative verification on a quantised KV cache, so it is the one that had to be checked: accept length 3.5545 of 4, against 3.5565 on bf16 KV (-0.06%). Quantising the cache does not degrade drafting.",
+            "ref": "97.7% on the 0.5.13 image (patched, no speculation, bf16 KV). Difference -0.4 pp = -0.7 sigma on n=1319 vs n=1319, i.e. not resolvable at this sample size. gfx942 re-run 97.2%."
+          }
+        ],
+        "benchmarks": [
+          {
+            "isl": 8192,
+            "osl": 1024,
+            "concurrency": 1,
+            "ttft_ms": 444.0,
+            "tpot_ms": 4.9,
+            "decode_tok_s": 204.0,
+            "output_tok_s": 187.5,
+            "total_tok_s": 1687.53,
+            "tok_s_per_gpu": 210.9,
+            "source": "glm52_fp8_mi355x_playbook.md section 4.2 (bench_serving, random, --random-range-ratio 1.0, --flush-cache, warmup burst discarded; rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820, sglang 0.5.17.dev20260820+g47fc97d754, aiter d9e5ef7ce)"
+          },
+          {
+            "isl": 8192,
+            "osl": 1024,
+            "concurrency": 8,
+            "ttft_ms": 1150.0,
+            "tpot_ms": 9.34,
+            "output_tok_s": 726.58,
+            "total_tok_s": 6539.2,
+            "tok_s_per_gpu": 817.4,
+            "source": "glm52_fp8_mi355x_playbook.md section 4.2 (bench_serving, random, --random-range-ratio 1.0, --flush-cache, warmup burst discarded; rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820, sglang 0.5.17.dev20260820+g47fc97d754, aiter d9e5ef7ce)"
+          },
+          {
+            "isl": 8192,
+            "osl": 1024,
+            "concurrency": 16,
+            "ttft_ms": 1662.0,
+            "tpot_ms": 13.22,
+            "output_tok_s": 1000.89,
+            "total_tok_s": 9008.01,
+            "tok_s_per_gpu": 1126.0,
+            "source": "glm52_fp8_mi355x_playbook.md section 4.2 (bench_serving, random, --random-range-ratio 1.0, --flush-cache, warmup burst discarded; rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820, sglang 0.5.17.dev20260820+g47fc97d754, aiter d9e5ef7ce)"
+          },
+          {
+            "isl": 8192,
+            "osl": 1024,
+            "concurrency": 32,
+            "ttft_ms": 3053.0,
+            "tpot_ms": 19.67,
+            "output_tok_s": 1328.49,
+            "total_tok_s": 11956.42,
+            "tok_s_per_gpu": 1494.6,
+            "source": "glm52_fp8_mi355x_playbook.md section 4.2 (bench_serving, random, --random-range-ratio 1.0, --flush-cache, warmup burst discarded; rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820, sglang 0.5.17.dev20260820+g47fc97d754, aiter d9e5ef7ce)"
+          },
+          {
+            "isl": 8192,
+            "osl": 1024,
+            "concurrency": 64,
+            "ttft_ms": 20312.0,
+            "tpot_ms": 47.15,
+            "output_tok_s": 921.62,
+            "total_tok_s": 8294.55,
+            "tok_s_per_gpu": 1036.8,
+            "source": "glm52_fp8_mi355x_playbook.md section 4.2 (bench_serving, random, --random-range-ratio 1.0, --flush-cache, warmup burst discarded; rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820, sglang 0.5.17.dev20260820+g47fc97d754, aiter d9e5ef7ce)"
+          },
+          {
+            "isl": 8192,
+            "osl": 512,
+            "concurrency": 1,
+            "ttft_ms": 450.0,
+            "tpot_ms": 4.82,
+            "decode_tok_s": 207.5,
+            "output_tok_s": 175.54,
+            "total_tok_s": 2984.25,
+            "tok_s_per_gpu": 373.0,
+            "source": "glm52_fp8_mi355x_playbook.md section 4.2 (bench_serving, random, --random-range-ratio 1.0, --flush-cache, warmup burst discarded; rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820, sglang 0.5.17.dev20260820+g47fc97d754, aiter d9e5ef7ce)"
+          },
+          {
+            "isl": 32768,
+            "osl": 512,
+            "concurrency": 1,
+            "ttft_ms": 1776.0,
+            "tpot_ms": 5.04,
+            "decode_tok_s": 198.5,
+            "output_tok_s": 117.6,
+            "total_tok_s": 7644.05,
+            "tok_s_per_gpu": 955.5,
+            "source": "glm52_fp8_mi355x_playbook.md section 4.2 (bench_serving, random, --random-range-ratio 1.0, --flush-cache, warmup burst discarded; rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820, sglang 0.5.17.dev20260820+g47fc97d754, aiter d9e5ef7ce)"
+          }
+        ],
+        "vs_nvidia": [],
+        "gotchas": [
+          "The two mandatory gfx950 bpreshuffle patches are NOT needed on this image, and applying them now costs throughput. This cell's own predecessor stated the exit condition: \"upstream permanent fix is the CK kernel rewrite ROCm/rocm-libraries#8639, which supersedes the disable workaround; not in aiter 7d604afe5, so the source workaround is required for now.\" This image ships aiter d9e5ef7ce, and #8639 is present in its CK submodule (the VGPR-anchor asm volatile in blockwise_gemm_pipeline_xdlops_blockscale_b_preshuffle_v1/v3.hpp). sglang 0.5.17 agrees: _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7,2,0), so the flag is True by default here. Measured A/B on this image, same argv, patch the only difference: GSM8K 0.980 both arms (n=200), and the patched arm is slower in wall clock at every concurrency measured, on both request shapes: -8.8/-8.5/-9.0% at ISL 8192 / OSL 1024 and -7.2/-7.0/-7.0% on a 76k-context multi-turn shape, with output-token counts identical to 0.00% in all six pairs. Forcing the flag False also forces an aiter JIT build of the preshuffle_off modules at every start, which the image does not ship prebuilt, and skips a8w8_blockscale_bpreshuffle_tuned_gemm_glm5.2.csv, a GLM-5.2-specific tuned table for exactly this kernel. On an older image, or any ROCm below 7.2, keep the patches.",
+          "Concurrency is the wrong knob; tokens are. The admission ceiling is floor(KV_pool_tokens / peak_context_tokens), and concurrency / that ceiling ordered every point measured across all six configs, both KV dtypes and every pool size: below 1.0 all 14 points were healthy, above it all 5 collapsed, with a 4.5x gap and nothing in it. Past 1.0, --schedule-policy decides how bad it gets -- lpm beat fcfs by 2.8-11x on otherwise comparable points. Read the pool from get_server_info at startup and the peak context off your own traffic; you can tell which side of the cliff you are on without benchmarking. --max-running-requests is an upper bound only, and on this model at real context lengths it is almost never the binding one.",
+          "Keep --chunked-prefill-size at or below 32768; an unchunked long prefill trips the tilelang DSA tile limit.",
+          "FP8 KV is legal with the DSA tilelang backend on ROCm, and only on ROCm. _check_tilelang_dsa_fp8_kv raises only when not hip; the docstring says the CUDA kernel hardcodes bfloat16, and tilelang_sparse_fwd has a real is_fp8_kv branch into sparse_mla_fwd_decode_partial_fp8 with gfx950 tuning. MLA/DSA stores one compressed latent per token (512 nope + 64 rope), so fp8 is a clean ~2x cut in bytes per token: the pool measured 1,645,440 tokens at bf16 and 3,194,368 at fp8_e4m3 (1.94x). The earlier \"FP8 KV is incompatible with tilelang\" note was a CUDA rule and is stale for ROCm on 0.5.17. Accuracy gate: GSM8K is unchanged (+0.0 pp, 0 of 200 problems moved) and speculative accept length is unchanged (3.5474 bf16 -> 3.5340 fp8, -0.38%).",
+          "NOT YET VERIFIED for long-context accuracy. GSM8K prompts are ~300 tokens; KV quantisation error accumulates with context, so a short-prompt eval cannot clear fp8 for a fleet running at tens of thousands of tokens. The isl ladder in this cell measures SPEED at long context, not correctness. Before shipping fp8 KV on long prompts, replay your own long requests through a bf16 and an fp8 pool and diff the outputs.",
+          "MTP/NEXTN works on ROCm for glm_moe_dsa as of 0.5.17 -- the earlier \"not enabled on AMD\" note is retired. GlmMoeDsaForCausalLMNextN is in models/glm4_moe.py, model_config.py swaps the draft architecture in, and speculative_hook.py sets --speculative-draft-model-path to the model path itself (the draft rides in the same checkpoint -- there is no second download) and auto-chooses (num_steps, eagle_topk, num_draft_tokens) = (3, 1, 4) for this architecture. Enabling speculation also silently resets --max-running-requests to 48 when it is unset. One caveat that is real but not fatal: the DSA MTP metadata precompute falls back to a non-fused path on ROCm (if _is_cuda and not _is_hip: in dsa_backend_mtp_precompute.py), so the ROCm accept path is not yet running its fastest kernel. Measured accept length 3.56 of 4 on GSM8K.",
+          "Do not read this cell's accept length off the benchmark table. The rows above are --dataset-name random, and this repo's standing finding applies here too: uniformly random token ids at temperature 0 with ignore_eos push the model into low-entropy text that a draft predicts almost perfectly. Measured on GLM-5.2 with degeneracy_probe.py at ISL 8192 -- unique token ratio 0.0176, most-repeated 8-gram 27x over 512 generated tokens. Accept length by workload on this model: 3.994 of 4 on random, 2.969 on ShareGPT, 3.5565 on GSM8K. The synthetic rows are kept because they are what makes this table comparable to the 0.5.13 cell they replace, but size speculative decoding from the ShareGPT and GSM8K figures, not from the random one.",
+          "LONG-CONTEXT LIMIT, and it is the sharp edge on this cell. An fp8 KV pool leaves very little free VRAM after the static reservation, and a long chunked prefill needs a transient working set on top of it -- including the fp8 DSA indexer Triton kernel _gluon_fp8_mqa_logits_kernel, which is device-loaded lazily on first LONG-CONTEXT use rather than at engine init. When that runs out the process does not degrade, it aborts: HSA_STATUS_ERROR_OUT_OF_RESOURCES, \"Available Free mem : 0 MB\", Fatal Python error: Aborted. Measured boundary on this recipe at 0.88: 8k ok, 32k ok, 131k ABORTS, at a token usage of 0.04 -- the KV pool was nearly empty, so this is not the capacity rule and raising the pool does not help. That is why this cell's ISL ladder stops at 32k. The failure mode is the dangerous part: the server starts, answers /health, serves a full concurrency sweep and scores a 1319-problem GSM8K first. No health probe or short-prompt eval can see it. If you need long context, use the bf16 KV cell, which was verified to 262k on the same node, or lower --mem-fraction-static further and re-verify at YOUR longest prompt before shipping.",
+          "--cuda-graph-max-bs is a hard ceiling, not a hint: every decode batch wider than it runs eager. These recipes set 32, so the concurrency-64 row is measuring that flag, not the recipe's limit. Verified from the scheduler's own decode lines -- 0 of 50 batches eager at running-req <= 32, 88 of 88 eager above it -- and aggregate throughput FALLS from concurrency 32 to 64 while the pool sits at 17% used, which contention cannot explain. It is also not scheduling: holding everything else fixed and flipping --schedule-policy fcfs -> lpm at that same point moves TTFT +0.6%, TPOT -0.7%, throughput +0.4% and accept length +0.5% -- nothing, because an almost-empty pool has no queue to reorder. If you intend to run wider than 32, raise --cuda-graph-max-bs with the width."
+        ],
+        "provenance": {
+          "image": "rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820",
+          "pr": "https://github.com/sgl-project/sglang/pull/28471 (original AMD recipe)",
+          "sglang": "0.5.17.dev20260820+g47fc97d754, stock image, NO source patches -- the two gfx950 bpreshuffle disables the 0.5.13 recipe required are counter-productive here (see gotchas)",
+          "aiter": "d9e5ef7ce; SGLANG_USE_AITER=1; gfx950 bpreshuffle path ENABLED (upstream default on ROCm >= 7.2)",
+          "rocm": "7.2.4",
+          "date": "2026-08-20",
+          "node": "8x AMD Instinct MI355X (gfx950), 288 GiB each, single node"
+        }
+      },
+      {
+        "hw_name": "MI355X",
+        "gfx": "gfx950",
+        "gpus": 8,
+        "quant": "FP8 (block-FP8 MoE weights), fp8_e4m3 KV cache",
+        "strategy": "high-throughput",
+        "nodes": "single",
+        "verified": true,
+        "docker_image": "rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820",
+        "launch_python": "# gfx950 / MI355X, high-throughput: fp8_e4m3 KV, no speculation, widest batch.\n# --schedule-policy lpm is what keeps this survivable once the pool is full.\nexport SGLANG_USE_AITER=1\nexport PYTORCH_HIP_ALLOC_CONF=expandable_segments:True\npython3 -m sglang.launch_server \\\n  --model-path zai-org/GLM-5.2-FP8 \\\n  --served-model-name glm-5.2 \\\n  --trust-remote-code \\\n  --tp 8 \\\n  --dsa-prefill-backend tilelang \\\n  --dsa-decode-backend tilelang \\\n  --kv-cache-dtype fp8_e4m3 \\\n  --chunked-prefill-size 32768 \\\n  --mem-fraction-static 0.92 \\\n  --cuda-graph-max-bs 64 \\\n  --max-running-requests 64 \\\n  --schedule-policy lpm \\\n  --num-continuous-decode-steps 2 \\\n  --reasoning-parser glm45 \\\n  --tool-call-parser glm47 \\\n  --watchdog-timeout 1200 \\\n  --host 0.0.0.0 \\\n  --port 30000",
+        "parallelism": {
+          "tp": 8,
+          "ep": null,
+          "dp": null
+        },
+        "attention_backend": "DSA tilelang (prefill+decode)",
+        "moe_backend": null,
+        "aiter": {
+          "enabled": true,
+          "commit": "d9e5ef7ce",
+          "kernels": [
+            "block-FP8 GEMM (a8w8_blockscale_bpreshuffle, gfx950 path ENABLED)"
+          ],
+          "tuned_artifacts": [
+            "a8w8_blockscale_bpreshuffle_tuned_gemm_glm5.2.csv"
+          ],
+          "summary": "AITER enabled (SGLANG_USE_AITER=1) with the gfx950 block-FP8 bpreshuffle path left ON, which is the 0.5.17 default on ROCm >= 7.2. The image ships the preshuffle_ON CK modules prebuilt and a GLM-5.2-specific tuned table for that kernel; the 0.5.13 recipe's source disable forfeits both and measured ~7% slower at identical GSM8K. DSA attention runs through tilelang, not AITER."
+        },
+        "env": [
+          {
+            "key": "SGLANG_USE_AITER",
+            "value": "1",
+            "why": "AITER kernels; on this image that includes the GLM-5.2-specific bpreshuffle tuned GEMM table"
+          },
+          {
+            "key": "PYTORCH_HIP_ALLOC_CONF",
+            "value": "expandable_segments:True",
+            "why": "reduce HIP allocator fragmentation for large MoE weights"
+          }
+        ],
+        "accuracy": [
+          {
+            "name": "GSM8K",
+            "value": "97.2%",
+            "note": "n=1319, same harness and flags as the other two cells. No speculation in this cell, so this is a clean read on fp8_e4m3 KV on its own: +0.0 pp against bf16 KV over 200 problems in the gating run, and unchanged at n=1319.",
+            "ref": "97.7% on the 0.5.13 image (patched, no speculation, bf16 KV). Difference -0.5 pp = -0.8 sigma on n=1319 vs n=1319, i.e. not resolvable at this sample size. gfx942 re-run 97.2%."
+          }
+        ],
+        "benchmarks": [
+          {
+            "isl": 8192,
+            "osl": 1024,
+            "concurrency": 1,
+            "ttft_ms": 423.0,
+            "tpot_ms": 12.37,
+            "decode_tok_s": 80.9,
+            "output_tok_s": 78.29,
+            "total_tok_s": 704.63,
+            "tok_s_per_gpu": 88.1,
+            "source": "glm52_fp8_mi355x_playbook.md section 4.3 (bench_serving, random, --random-range-ratio 1.0, --flush-cache, warmup burst discarded; rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820, sglang 0.5.17.dev20260820+g47fc97d754, aiter d9e5ef7ce)"
+          },
+          {
+            "isl": 8192,
+            "osl": 1024,
+            "concurrency": 8,
+            "ttft_ms": 1970.0,
+            "tpot_ms": 16.79,
+            "output_tok_s": 427.81,
+            "total_tok_s": 3850.29,
+            "tok_s_per_gpu": 481.3,
+            "source": "glm52_fp8_mi355x_playbook.md section 4.3 (bench_serving, random, --random-range-ratio 1.0, --flush-cache, warmup burst discarded; rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820, sglang 0.5.17.dev20260820+g47fc97d754, aiter d9e5ef7ce)"
+          },
+          {
+            "isl": 8192,
+            "osl": 1024,
+            "concurrency": 16,
+            "ttft_ms": 3594.0,
+            "tpot_ms": 20.11,
+            "output_tok_s": 677.73,
+            "total_tok_s": 6099.61,
+            "tok_s_per_gpu": 762.5,
+            "source": "glm52_fp8_mi355x_playbook.md section 4.3 (bench_serving, random, --random-range-ratio 1.0, --flush-cache, warmup burst discarded; rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820, sglang 0.5.17.dev20260820+g47fc97d754, aiter d9e5ef7ce)"
+          },
+          {
+            "isl": 8192,
+            "osl": 1024,
+            "concurrency": 32,
+            "ttft_ms": 6785.0,
+            "tpot_ms": 27.19,
+            "output_tok_s": 946.84,
+            "total_tok_s": 8521.59,
+            "tok_s_per_gpu": 1065.2,
+            "source": "glm52_fp8_mi355x_playbook.md section 4.3 (bench_serving, random, --random-range-ratio 1.0, --flush-cache, warmup burst discarded; rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820, sglang 0.5.17.dev20260820+g47fc97d754, aiter d9e5ef7ce)"
+          },
+          {
+            "isl": 8192,
+            "osl": 1024,
+            "concurrency": 64,
+            "ttft_ms": 13089.0,
+            "tpot_ms": 37.39,
+            "output_tok_s": 1276.16,
+            "total_tok_s": 11485.42,
+            "tok_s_per_gpu": 1435.7,
+            "source": "glm52_fp8_mi355x_playbook.md section 4.3 (bench_serving, random, --random-range-ratio 1.0, --flush-cache, warmup burst discarded; rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820, sglang 0.5.17.dev20260820+g47fc97d754, aiter d9e5ef7ce)"
+          },
+          {
+            "isl": 8192,
+            "osl": 512,
+            "concurrency": 1,
+            "ttft_ms": 422.0,
+            "tpot_ms": 12.37,
+            "decode_tok_s": 80.8,
+            "output_tok_s": 75.83,
+            "total_tok_s": 1289.19,
+            "tok_s_per_gpu": 161.1,
+            "source": "glm52_fp8_mi355x_playbook.md section 4.3 (bench_serving, random, --random-range-ratio 1.0, --flush-cache, warmup burst discarded; rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820, sglang 0.5.17.dev20260820+g47fc97d754, aiter d9e5ef7ce)"
+          },
+          {
+            "isl": 32768,
+            "osl": 512,
+            "concurrency": 1,
+            "ttft_ms": 1982.0,
+            "tpot_ms": 12.82,
+            "decode_tok_s": 78.0,
+            "output_tok_s": 59.94,
+            "total_tok_s": 3896.38,
+            "tok_s_per_gpu": 487.0,
+            "source": "glm52_fp8_mi355x_playbook.md section 4.3 (bench_serving, random, --random-range-ratio 1.0, --flush-cache, warmup burst discarded; rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820, sglang 0.5.17.dev20260820+g47fc97d754, aiter d9e5ef7ce)"
+          },
+          {
+            "isl": 131072,
+            "osl": 512,
+            "concurrency": 1,
+            "ttft_ms": 8906.0,
+            "tpot_ms": 14.55,
+            "decode_tok_s": 68.7,
+            "output_tok_s": 31.32,
+            "total_tok_s": 8048.85,
+            "tok_s_per_gpu": 1006.1,
+            "source": "glm52_fp8_mi355x_playbook.md section 4.3 (bench_serving, random, --random-range-ratio 1.0, --flush-cache, warmup burst discarded; rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820, sglang 0.5.17.dev20260820+g47fc97d754, aiter d9e5ef7ce)"
+          },
+          {
+            "isl": 262144,
+            "osl": 512,
+            "concurrency": 1,
+            "ttft_ms": 22909.0,
+            "tpot_ms": 16.79,
+            "decode_tok_s": 59.6,
+            "output_tok_s": 16.26,
+            "total_tok_s": 8338.84,
+            "tok_s_per_gpu": 1042.4,
+            "source": "glm52_fp8_mi355x_playbook.md section 4.3 (bench_serving, random, --random-range-ratio 1.0, --flush-cache, warmup burst discarded; rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820, sglang 0.5.17.dev20260820+g47fc97d754, aiter d9e5ef7ce)"
+          }
+        ],
+        "vs_nvidia": [],
+        "gotchas": [
+          "The two mandatory gfx950 bpreshuffle patches are NOT needed on this image, and applying them now costs throughput. This cell's own predecessor stated the exit condition: \"upstream permanent fix is the CK kernel rewrite ROCm/rocm-libraries#8639, which supersedes the disable workaround; not in aiter 7d604afe5, so the source workaround is required for now.\" This image ships aiter d9e5ef7ce, and #8639 is present in its CK submodule (the VGPR-anchor asm volatile in blockwise_gemm_pipeline_xdlops_blockscale_b_preshuffle_v1/v3.hpp). sglang 0.5.17 agrees: _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7,2,0), so the flag is True by default here. Measured A/B on this image, same argv, patch the only difference: GSM8K 0.980 both arms (n=200), and the patched arm is slower in wall clock at every concurrency measured, on both request shapes: -8.8/-8.5/-9.0% at ISL 8192 / OSL 1024 and -7.2/-7.0/-7.0% on a 76k-context multi-turn shape, with output-token counts identical to 0.00% in all six pairs. Forcing the flag False also forces an aiter JIT build of the preshuffle_off modules at every start, which the image does not ship prebuilt, and skips a8w8_blockscale_bpreshuffle_tuned_gemm_glm5.2.csv, a GLM-5.2-specific tuned table for exactly this kernel. On an older image, or any ROCm below 7.2, keep the patches.",
+          "Concurrency is the wrong knob; tokens are. The admission ceiling is floor(KV_pool_tokens / peak_context_tokens), and concurrency / that ceiling ordered every point measured across all six configs, both KV dtypes and every pool size: below 1.0 all 14 points were healthy, above it all 5 collapsed, with a 4.5x gap and nothing in it. Past 1.0, --schedule-policy decides how bad it gets -- lpm beat fcfs by 2.8-11x on otherwise comparable points. Read the pool from get_server_info at startup and the peak context off your own traffic; you can tell which side of the cliff you are on without benchmarking. --max-running-requests is an upper bound only, and on this model at real context lengths it is almost never the binding one.",
+          "Keep --chunked-prefill-size at or below 32768; an unchunked long prefill trips the tilelang DSA tile limit.",
+          "FP8 KV is legal with the DSA tilelang backend on ROCm, and only on ROCm. _check_tilelang_dsa_fp8_kv raises only when not hip; the docstring says the CUDA kernel hardcodes bfloat16, and tilelang_sparse_fwd has a real is_fp8_kv branch into sparse_mla_fwd_decode_partial_fp8 with gfx950 tuning. MLA/DSA stores one compressed latent per token (512 nope + 64 rope), so fp8 is a clean ~2x cut in bytes per token: the pool measured 1,645,440 tokens at bf16 and 3,194,368 at fp8_e4m3 (1.94x). The earlier \"FP8 KV is incompatible with tilelang\" note was a CUDA rule and is stale for ROCm on 0.5.17. Accuracy gate: GSM8K is unchanged (+0.0 pp, 0 of 200 problems moved) and speculative accept length is unchanged (3.5474 bf16 -> 3.5340 fp8, -0.38%).",
+          "NOT YET VERIFIED for long-context accuracy. GSM8K prompts are ~300 tokens; KV quantisation error accumulates with context, so a short-prompt eval cannot clear fp8 for a fleet running at tens of thousands of tokens. The isl ladder in this cell measures SPEED at long context, not correctness. Before shipping fp8 KV on long prompts, replay your own long requests through a bf16 and an fp8 pool and diff the outputs.",
+          "LONG-CONTEXT LIMIT, and it is the sharp edge on this cell. An fp8 KV pool leaves very little free VRAM after the static reservation, and a long chunked prefill needs a transient working set on top of it -- including the fp8 DSA indexer Triton kernel _gluon_fp8_mqa_logits_kernel, which is device-loaded lazily on first LONG-CONTEXT use rather than at engine init. When that runs out the process does not degrade, it aborts: HSA_STATUS_ERROR_OUT_OF_RESOURCES, \"Available Free mem : 0 MB\", Fatal Python error: Aborted. Measured boundary on this recipe at 0.88: 8k ok, 32k ok, 131k ABORTS, at a token usage of 0.04 -- the KV pool was nearly empty, so this is not the capacity rule and raising the pool does not help. That is why this cell's ISL ladder stops at 32k. The failure mode is the dangerous part: the server starts, answers /health, serves a full concurrency sweep and scores a 1319-problem GSM8K first. No health probe or short-prompt eval can see it. If you need long context, use the bf16 KV cell, which was verified to 262k on the same node, or lower --mem-fraction-static further and re-verify at YOUR longest prompt before shipping."
+        ],
+        "provenance": {
+          "image": "rocm/sgl-dev:v0.5.17-rocm724-mi35x-20260820",
+          "pr": "https://github.com/sgl-project/sglang/pull/28471 (original AMD recipe)",
+          "sglang": "0.5.17.dev20260820+g47fc97d754, stock image, NO source patches -- the two gfx950 bpreshuffle disables the 0.5.13 recipe required are counter-productive here (see gotchas)",
+          "aiter": "d9e5ef7ce; SGLANG_USE_AITER=1; gfx950 bpreshuffle path ENABLED (upstream default on ROCm >= 7.2)",
+          "rocm": "7.2.4",
+          "date": "2026-08-20",
+          "node": "8x AMD Instinct MI355X (gfx950), 288 GiB each, single node"
         }
       }
     ],
     "gaps": [
       {
-        "title": "balanced / high-throughput",
-        "kind": "strategy",
-        "note": "Match the NV balanced recipe: add DP-attention + DeepEP, then sweep concurrency. Relaunch with --dp 8 --enable-dp-attention --moe-a2a-backend deepep, then:",
-        "cmd": "# throughput vs concurrency (online)\nfor C in 1 16 64; do\n  python3 -m sglang.bench_serving --backend sglang --dataset-name random \\\n    --random-input-len 8192 --random-output-len 1024 --random-range-ratio 1.0 \\\n    --num-prompts $((C*2)) --max-concurrency $C --port 30000\ndone"
+        "title": "fp8 KV at long context -- accuracy",
+        "kind": "accuracy",
+        "note": "The blocker before fp8_e4m3 KV should be trusted on long prompts. GSM8K prompts are ~300 tokens and KV quantisation error accumulates with context, so the passing short-prompt gate says nothing about a 76k-token request. The isl ladder in the fp8 cells measures speed, not correctness. Replay your own long requests through both pools and diff:",
+        "cmd": "# same server flags twice, only the KV dtype differs\n#   --kv-cache-dtype bfloat16   vs   --kv-cache-dtype fp8_e4m3\n# then, for a few hundred of YOUR real long prompts, at temperature 0:\npython3 - <<'EOF'\nimport json, difflib, urllib.request\ndef ask(port, prompt):\n    req = urllib.request.Request(\n        f'http://127.0.0.1:{port}/v1/chat/completions',\n        json.dumps({'model': 'glm-5.2', 'temperature': 0, 'max_tokens': 1024,\n                    'messages': [{'role': 'user', 'content': prompt}]}).encode(),\n        {'Content-Type': 'application/json'})\n    return json.load(urllib.request.urlopen(req))['choices'][0]['message']['content']\nfor prompt in map(str.strip, open('long_prompts.txt')):\n    a, b = ask(30000, prompt), ask(30001, prompt)\n    if a != b:\n        print(''.join(difflib.unified_diff(a.splitlines(1), b.splitlines(1))))\nEOF"
       },
       {
-        "title": "MTP / speculative decode",
-        "kind": "dependency",
-        "note": "Not enabled on AMD for glm_moe_dsa yet — this is most of the ~3–4× decode gap vs NVIDIA. Tracking upstream; no AMD script until EAGLE/MTP lands on ROCm.",
-        "cmd": null
+        "title": "AIME25 on 0.5.17",
+        "kind": "accuracy",
+        "note": "The 91.5% carried in the low-latency cell was measured on the 0.5.13 image with the no-speculation recipe. It has not been re-run on 0.5.17, on any of the three cells. Speculative decoding verifies exactly and fp8 KV did not move GSM8K, so it should hold, but it is unmeasured. sgl-eval, not in-tree run_eval:",
+        "cmd": "pip install git+https://github.com/sgl-project/sgl-eval\nsgl-eval run aime25 --api-key EMPTY --base-url http://localhost:30000/v1 \\\n  --n-repeats 16 --max-tokens 64000 --temperature 1.0 --top-p 0.95 --thinking"
+      },
+      {
+        "title": "DP-attention + DeepEP",
+        "kind": "strategy",
+        "note": "Still untried on this model. The three cells here differ only in KV dtype, speculation and batch-width flags; none of them changes the parallelism. Relaunch with --dp 8 --enable-dp-attention --moe-a2a-backend deepep, then re-run the sweep:",
+        "cmd": "# throughput vs concurrency (online)\nfor C in 1 16 64; do\n  python3 -m sglang.bench_serving --backend sglang --dataset-name random \\\n    --random-input-len 8192 --random-output-len 1024 --random-range-ratio 1.0 \\\n    --num-prompts $((C*2)) --max-concurrency $C --port 30000\ndone"
       }
     ]
   },
