@@ -30,9 +30,9 @@
 #      BF16 GEMM. The server starts, serves /health, and then dies on the
 #      first real request.
 #
-# Every value below is read live from torch and amd-smi. Nothing is hardcoded:
-# if the node is not what this script assumes, the output is wrong in an
-# obvious way rather than a plausible one.
+# Architecture, device count, compute units and VRAM are read live from torch
+# and amd-smi. The marketing name is intentionally fixed because this shim is
+# only for the homogeneous MI355X nodes described above.
 #
 # Install (container-local, reversible):
 #   mv  /opt/rocm/bin/rocminfo /opt/rocm/bin/rocminfo.rocr-broken
@@ -53,7 +53,14 @@ echo "*** rocminfo shim -- see glm53_flash/rocminfo_shim.sh for why ***"
 
 idx=0
 while [ "$idx" -lt "$count" ]; do
-  vram_mb="$(amd-smi metric -g "$idx" 2>/dev/null | awk '/TOTAL_VRAM:/{print $2; exit}')"
+  if ! vram_mb="$(amd-smi metric -g "$idx" 2>/dev/null | awk '/TOTAL_VRAM:/{print $2; exit}')"; then
+    echo "ERROR: amd-smi metric failed for GPU $idx" >&2
+    exit 1
+  fi
+  if [[ ! "$vram_mb" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: amd-smi metric returned no numeric TOTAL_VRAM for GPU $idx" >&2
+    exit 1
+  fi
   vram_kb=$(( vram_mb * 1024 ))
   cat <<AGENT
 Agent $((idx + 2))

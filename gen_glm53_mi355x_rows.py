@@ -19,8 +19,8 @@ three-repeat set -- and rely on living in the same tagged results directory for
 provenance.  Do not read "validated" as meaning the same thing for both.
 
 Pass ``--check-models models.js`` to additionally fail unless the published
-rows are byte-identical to the ones regenerated here.  ``verify.sh`` runs that
-form; a bare invocation only prints.
+rows are structurally equal to the ones regenerated here.  ``verify.sh`` runs
+that form; a bare invocation only prints.
 """
 
 from __future__ import annotations
@@ -130,10 +130,16 @@ def load_latency(root: Path) -> dict[int, list[dict]]:
         ]
         for record in records:
             isl = record["input_len"]
+            key = (isl, repeat)
             if record.get("batch_size") != 1 or record.get("output_len") != 1024:
                 raise ValueError(f"{path}: unexpected latency shape {record}")
+            if key in seen:
+                raise ValueError(
+                    f"{path}: duplicate latency record for input_len={isl}, "
+                    f"repeat={repeat}"
+                )
             grouped[isl].append(record)
-            seen.add((isl, repeat))
+            seen.add(key)
 
     expected_seen = {(isl, r) for isl in ISLS for r in REPEATS}
     if seen != expected_seen:

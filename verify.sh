@@ -2,7 +2,7 @@
 # Run every check this repo has, in cheapest-first order.
 #
 # The point of collecting them here is the third one. `--check-models` is what
-# proves the published benchmark rows are still byte-identical to the rows
+# proves the published benchmark rows are still structurally equal to the rows
 # regenerated from the raw records; left as an optional flag nobody passes, the
 # strongest guarantee in the repo silently never runs.
 #
@@ -29,6 +29,9 @@ step() {
 
 step "offline models.js / glossary / benchmark-row checks" \
   node verify-cookbook.js
+
+step "GLM-5.3 verification regression tests" \
+  python3 -m unittest -q test_glm53_verification.py
 
 # Regenerating the rows needs the raw run, which is not in the repo. Skip
 # loudly rather than passing quietly when it is absent.
