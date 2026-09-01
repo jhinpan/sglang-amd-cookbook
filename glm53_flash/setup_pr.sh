@@ -33,7 +33,12 @@ git log -1 --format='%H %ci %s'
 # Fetching the exact object pins the tree just as tightly and survives a rebase.
 git fetch --no-tags origin '${SGLANG_HEAD}' 2>/dev/null \
   || git fetch --no-tags origin 'pull/${SGLANG_PR}/head'
-git cat-file -e '${SGLANG_HEAD}^{commit}' || exit 1
+git cat-file -e '${SGLANG_HEAD}^{commit}' || {
+  echo 'FATAL: commit ${SGLANG_HEAD} is unreachable. The PR branch was rebased and the'
+  echo '       old commit garbage-collected. Re-measure against a current head rather'
+  echo '       than substituting one -- the published numbers are tied to this tree.'
+  exit 1
+}
 git checkout -q --detach '${SGLANG_HEAD}'
 git merge-base --is-ancestor '${SGLANG_HEAD}' FETCH_HEAD 2>/dev/null \
   || echo 'note: measured commit is no longer an ancestor of the PR head (rebased upstream); the tree checked out above is still exactly the measured one'
