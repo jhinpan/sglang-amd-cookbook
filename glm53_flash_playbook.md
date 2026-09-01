@@ -385,3 +385,147 @@ serving record's `server_info`. `bench_one_batch_server` does not emit
 (batch size, output length, the three-repeat set) and rely on directory
 provenance for which server produced them. Keep latency runs inside the same
 tagged results directory as the serving runs, or that link is lost.
+
+## 12. Why a 25% kernel win can be a 0% serving win
+
+`ROCm/aiter#5069` retuned the GLM-5.2 a8w8 and BF16 GEMM configs for gfx950 and
+reported, from its own measurement, 49 shapes going 3606.4us -> 2702.1us
+(**-25.08%**), median +22.76% per shape, zero regressions. We A/B'd it on one
+8x MI355X node with the same image, SGLang worktree, recipe and bench protocol,
+changing **only the four tuning CSVs**:
+
+| conc | GLM-5.2 delta | GLM-5.3 delta |
+|---:|---:|---:|
+| 1 | +0.06% | -0.01% |
+| 8 | -0.05% | +0.05% |
+| 16 | -0.02% | +0.08% |
+| 32 | -0.05% | -0.00% |
+| 64 | -0.09% | +0.15% |
+
+Ten points, all inside a 0.04-0.35% noise floor. Both arms passed the GSM8K
+gate. Before reading anything into a null result, we falsified it twice:
+
+- **The arms really were different.** Each arm records the sha256 of what it
+  deployed: a8w8 `b453...` vs `a361...`, bf16 `c84f...` vs `01da...`.
+- **The change really did engage.** GLM-5.2's BF16 lookup misses fell
+  **1256 -> 616**, exactly the `N=256, K=6144` half that the PR added rows for.
+
+So the tuning worked and the serving throughput did not move. That is not bad
+luck; it is structural.
+
+### 12.1 Almost nothing in the model reads the tuned-GEMM table
+
+`aiter.tuned_gemm.tgemm` has three call sites in SGLang, and one of them
+(`kernels/ops/attention/dsv4/gemm.py`) is CUDA-only, i.e. dead on ROCm. For a
+GLM-5.x FP8 checkpoint the live ones are:
+
+| Module | Shape | Route |
+|---|---|---|
+| MoE router / gate | `N = n_routed_experts`, `K = hidden` | `tgemm.mm` |
+| DSA indexer `weights_proj` (no `quant_config`, so bf16) | `N = n_heads`, `K = hidden` | `tgemm.mm` |
+
+Everything else goes elsewhere: `qkv_a` / `q_b` / `o_proj` / `gate_up` /
+`down_proj` / shared experts / KDA projections all land on
+`aiter_w8a8_block_fp8_linear` -> `gemm_a8w8_blockscale*`; routed experts go to
+`aiter.fused_moe` and `tuned_fmoe.csv`; `lm_head` is a plain `torch.matmul` in
+`logits_processor.py`. Three different tuning tables, and the recipe's headline
+GEMMs are in none of the ones this PR touched.
+
+The serving logs agree exactly: across both A/B arms the only `(N,K)` pairs that
+ever reach the BF16 table are `(256, 6144)` and `(32, 6144)` -- the router and
+the indexer. Both are tiny.
+
+Worse, half the PR is unreachable in this configuration. The non-block-scale
+`gemm_a8w8_bpreshuffle` that `a8w8_bpreshuffle_tuned_gemm_glm5.2.csv` feeds is
+only reached when `SGLANG_USE_AITER_FP8_PER_TOKEN` is set. GLM-5.2-FP8 is block
+quantized (`weight_block_size: [128, 128]`), so it takes `gemm_a8w8_blockscale*`
+instead. **Ninety-nine of the PR's 189 changed gfx950 rows are never read.**
+
+### 12.2 The tuner optimises M values that serving never produces
+
+Which shapes get tuned is decided entirely by the `*_untuned_gemm*.csv` shape
+list. Those lists are a geometric ladder:
+
+```
+bf16 : 1 2 4 8 16 24 32 48 64 96 128 192 256 384 512 768 1024 1536 2048 3072 4096 8192 16384 32768
+a8w8 : 1 2 4 8 16 32 64 128 256 512 1024 2048 4096 8192 16384 32768
+```
+
+Serving produces dense, arbitrary M -- chunked prefill and continuous batching
+do not round to powers of two:
+
+```
+320 384 448 640 704 768 832 896 960 1024 1216 1984 6016 6528 6848 7104 7109 7168 7448 ...
+```
+
+Lookup does soften this. `get_GEMM_A16W16_config` probes three times: exact M,
+then `getPaddedM(M,N,K,0)` (round up to a multiple of 16/32/64/128 by size
+band), then `getPaddedM(M,N,K,1)` (`nextPow2`), then gives up. So `M=6016` runs
+the kernel tuned for `M=8192`, and anything just past a power of two can be
+served by a config tuned for nearly twice its size.
+
+AITER already ships the fix for the shape list: `AITER_TUNE_GEMM=1` appends
+every shape a real workload actually executes to the untuned CSV. A ladder of
+powers of two is what you get when that step is skipped.
+
+### 12.3 Even a perfect GEMM win is capped by what GEMM costs
+
+A torch-profiler capture of the published GLM-5.3 cell (concurrency 32, ISL
+8192) is worth reading carefully, because the raw numbers lie.
+`aiter::cross_device_reduce_2stage` appears to own **97.4%** of GPU time -- but
+6 of its 182 calls account for 98.9% of that, the longest running 2.35 seconds,
+against a median of 282us. Those are ranks waiting at the collective, not
+reducing. With the waits removed:
+
+| Bucket | Share of real GPU compute |
+|---|---:|
+| TP all-reduce (genuine) | **29.9%** |
+| MoE (`tuned_fmoe.csv`) | 18.8% |
+| GEMM, **all** backends including blockscale | 17.3% |
+| Other | 11.8% |
+| mHC fusion | 10.1% |
+| KDA linear attention | 6.1% |
+| DSA attention | 1.7% |
+
+Even if the retuned shapes were the entire GEMM bucket, 25% off 17.3% is 4.3%
+end to end. They are instead the router and indexer slivers inside it.
+
+### 12.4 What the coverage census actually found
+
+`AITER_LOG_TUNED_CONFIG=1` logs the row each lookup resolves to. Running it
+under a representative load on the published GLM-5.3 recipe:
+
+| | |
+|---|---:|
+| Distinct shapes that hit the BF16 table | 104 |
+| Distinct shapes that missed | **1616** |
+| Misses that fell through to plain `torch` `F.linear` | 1608 |
+| Hits at exactly the tuned M | 69.2% |
+| Hits padded up, by up to 2.0x | 30.8% |
+
+The gfx950 half of the `glm53_bf16_tuned_gemm.csv` this cookbook pins covers
+**M = 1 and M = 32 only** -- precisely the two captured decode graph tiers.
+Chunked prefill drives M to 8192. So the BF16 path runs unoptimised PyTorch for
+the overwhelming majority of distinct shapes, and the interesting work is not
+"retune the rows we have" but "the table is nearly empty for this workload".
+
+### 12.5 What to demand of a tuning claim
+
+An op-level speedup is a hypothesis about serving, not evidence of it. Before
+believing one, ask for three things:
+
+1. **Route proof** -- does the model read the table that changed? Check the
+   call site, not the filename. `/tmp/aiter_configs/` shows which merged tables
+   the process actually materialised; `AITER_LOG_TUNED_CONFIG=1` shows which
+   rows resolve. Note the merge is keyed on `(gfx, cu_num, M, N, K, ...)` and
+   drops the model name entirely, so a row tuned for one model will be selected
+   for another whenever the shape matches.
+2. **Mechanism proof** -- did the change engage? A hit/miss census before and
+   after, so a null result cannot be confused with a no-op deployment.
+3. **End-to-end A/B** -- same node, same image, same recipe, one variable, three
+   repeats, correctness gate before timing, and a significance bar set from the
+   arms' own spread. `verify.sh` and the harness conventions in section 9 are
+   the shape of it.
+
+Report the null results too. A 25% kernel win that does not move serving is a
+useful fact about where the time actually goes.

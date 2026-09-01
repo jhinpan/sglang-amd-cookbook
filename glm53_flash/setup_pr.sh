@@ -27,9 +27,16 @@ set -euo pipefail
 cd /sgl-workspace/sglang
 echo '--- before ---'
 git log -1 --format='%H %ci %s'
-git fetch --no-tags origin 'pull/${SGLANG_PR}/head'
-git merge-base --is-ancestor '${SGLANG_HEAD}' FETCH_HEAD
+# The assertion here used to be 'the measured commit is still an ancestor of the
+# PR head'. That broke on 2026-08-31 when #36507 was rebased: the commit is fine,
+# the branch just no longer descends from it, and setup failed at step one.
+# Fetching the exact object pins the tree just as tightly and survives a rebase.
+git fetch --no-tags origin '${SGLANG_HEAD}' 2>/dev/null \
+  || git fetch --no-tags origin 'pull/${SGLANG_PR}/head'
+git cat-file -e '${SGLANG_HEAD}^{commit}' || exit 1
 git checkout -q --detach '${SGLANG_HEAD}'
+git merge-base --is-ancestor '${SGLANG_HEAD}' FETCH_HEAD 2>/dev/null \
+  || echo 'note: measured commit is no longer an ancestor of the PR head (rebased upstream); the tree checked out above is still exactly the measured one'
 echo '--- after ---'
 git log -1 --format='%H %ci %s'
 
